@@ -1,0 +1,338 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+		<title>reveal.js</title>
+
+		<link rel="stylesheet" href="css/reveal.css">
+		<link rel="stylesheet" href="css/theme/black.css">
+
+		<!-- Theme used for syntax highlighting of code -->
+		<link rel="stylesheet" href="lib/css/zenburn.css">
+
+    <style>
+      .reveal section .fullsize, .reveal pre .fullsize {
+        width: 100%;
+        height: 100%;
+        max-width: 100%;
+        max-height: 100%;
+        margin: 0px;
+      }
+
+      .reveal section img {
+        background: inherit;
+        border: 0;
+        box-shadow: none;
+      }
+
+      .smallerfont {
+        font-size: 85% !important;
+        line-height: 115% !important;
+      }
+
+      .hljs .state {
+        color: springgreen;
+        background: inherit;
+      }
+
+      .hljs .new, .hljs .new .hljs-type {
+        color: orangered;
+        background: inherit;
+      }
+
+      .hljs .async {
+        color: inherit;
+        background: inherit;
+        text-decoration: underline;
+      }
+    </style>
+
+		<!-- Printing and PDF exports -->
+		<script>
+			var link = document.createElement( 'link' );
+			link.rel = 'stylesheet';
+			link.type = 'text/css';
+			link.href = window.location.search.match( /print-pdf/gi ) ? 'css/print/pdf.css' : 'css/print/paper.css';
+			document.getElementsByTagName( 'head' )[0].appendChild( link );
+		</script>
+	</head>
+	<body>
+		<div class="reveal">
+			<div class="slides">
+				<section>
+          <h1>[EDS]Language first</h1>
+          <p><small>mikhail.vorozhtsov@gmail.com</small></p>
+          <p><small><a href="https://github.com/mvv">https://github.com/mvv</a></small></p>
+        </section>
+				<section>
+          <p>Protocol</p>
+          <img data-src="proto.svg">
+        </section>
+        <section class="fullsize">
+          <pre class="fullsize"><code class="hljs lang-scala fullsize smallerfont" data-trim style="height: auto">
+              def runTransfer(id: BucketId, remoteAddr: SocketAddr): Offset = {
+                file = openFile(id)
+                try {
+                  committedOffset = file.size()
+                  socket = connect(remoteAddr)
+                  try {
+                    socket.write(id ++ commitedOffset)
+                    answer = socket.read(2)
+                    if (answer != "OK")
+                      throw Exception("Invalid bucket/offset combination")
+                    loop {
+                      buf = socket.read()
+                      if (buf.isEmpty)
+                        return committedOffset
+                      file.write(buf)
+                      file.sync()
+                      committedOffset = commitedOffset + buf.size
+                      socket.write(committedOffset)
+                    }
+                  } finally {
+                    socket.close()
+                  }
+                } finally {
+                  file.close()
+                }
+              }
+          </code></pre>
+        </section>
+        <section>
+          <p><b>Typed</b> asynchronous request-response contract</p>
+          <pre><code class="hljs lang-scala" data-trim>
+              Start(BucketId) ~&gt; Started | AlreadyStarted
+              Stop ~&gt; ()
+              Progress ~&gt; NotStarted | Intializing | Transferring(Offset)
+          </code></pre>
+        </section>
+        <section>
+          <p style="margin: 0"><small>Contract handling</small></p>
+          <pre class="fullsize"><code class="hljs lang-scala fullsize smallerfont" data-trim data-noescape style="height: auto">
+              <mark class="state">bucketId</mark> := Some(loopUntilSome {
+                <mark class="async">contract.nextRequest</mark> match {
+                  case Start(id, req) =&gt;
+                    req.respond(Started)
+                    Some(id)
+                  case Stop(req) =&gt;
+                    req.respond()
+                    <mark class="new">exit</mark>
+                  case Progress(req) =&gt;
+                    req.respond(NotStarted)
+                    None
+                }
+              })
+              loop {
+                <mark class="async">contract.nextRequest</mark> match {
+                  case Start(_, req) =&gt;
+                    req.respond(AlreadyStarted)
+                  case Stop(req) =&gt;
+                    req.respond()
+                    <mark class="new">exit</mark>
+                  case Progress(req) =&gt;
+                    if (<mark class="state">initialized</mark>)
+                      req.respond(Transferring(<mark class="state">committedOffset</mark>))
+                    else
+                      req.respond(Initializing)
+                }
+              }
+          </code></pre>
+        </section>
+        <section>
+          <p style="margin: 0"><small>Transfer handling</small></p>
+          <pre class="fullsize"><code class="hljs lang-scala fullsize smallerfont" data-trim data-noescape style="height: auto">
+                id = <mark class="new"><mark class="async">waitUntilSome</mark></mark>(<mark class="state">bucketId</mark>)
+                file = <mark class="async">openFile(id)</mark>
+                try {
+                  <mark class="state">committedOffset</mark> := <mark class="async">file.size()</mark>
+                  socket = <mark class="async">connect(remoteAddr)</mark>
+                  try {
+                    <mark class="async">socket.write(id ++ commitedOffset)</mark>
+                    answer = <mark class="async">socket.read(2)</mark>
+                    if (answer != "OK")
+                      throw Exception("Invalid bucket/offset combination")
+                    <mark class="state">initialized</mark> := true
+                    loop {
+                      buf = <mark class="async">socket.read()</mark>
+                      if (buf.isEmpty)
+                        <mark class="new">exit</mark>
+                      <mark class="async">file.write(buf)</mark>
+                      <mark class="async">file.sync()</mark>
+                      <mark class="state">committedOffset</mark> := <mark class="state">commitedOffset</mark> + buf.size
+                      <mark class="async">socket.write(committedOffset)</mark>
+                    }
+                  } finally {
+                    socket.close()
+                  }
+                } finally {
+                  file.close()
+                }
+          </code></pre>
+        </section>
+        <section>
+          <p>Putting it together</p>
+          <pre style="margin: 0"><code class="hljs lang-scala" data-trim data-noescape>
+          def runTransfer(contract: Contract[TransferProto],
+                          remoteAddr: SocketAddr): <mark class="new">Spawn</mark>[Offset] = {
+            val result = try {
+              <mark class="new">runHandlers</mark>(
+                { <mark class="state">bucketId</mark> := None
+                  <mark class="state">initialized</mark> := false
+                  <mark class="state">committedOffset</mark> := 0 },
+                &lt;Contract handling&gt;,
+                &lt;Transfer handling&gt;)
+            } finally {
+              contract.close()
+            }
+            return result.<mark class="state">committedOffset</mark>
+          }
+          </code></pre>
+        </section>
+        <section>
+          <h2>What is I/O?</h2>
+          <p>Scala</p>
+          <pre><code class="hljs lang-scala" data-trim data-noescape>main(args: Array[String]): <mark class="new">Unit</mark></code></pre>
+          <p>Haskell</p>
+          <pre><code class="hljs lang-scala" data-trim data-noescape>main(): <mark class="new">IO</mark>[Unit]</code></pre>
+        </section>
+        <section class="fullsize">
+          <p>Tracing I/O</p>
+          <pre class="fullsize"><code class="hljs scala-scala fullsize smallerfont" data-trim data-noescape>
+            def execute(): Unit = {
+              executeTrace(main().<mark class="new">trace</mark>())
+            }
+
+            sealed trait TraceIO[A]
+            object TraceIO {
+              final case class Done(result: Try[A]) extends TraceIO[A]
+              final case class Continue[B](action: ActionIO[B],
+                                           onSuccess: B =&gt; TraceIO[A],
+                                           onFailure: Throwable =&gt; TraceIO[A])
+                               extends TraceIO[A]
+            }
+
+            def executeTrace(trace: TraceIO[A]): A = trace match {
+              case Done(result) =&gt; result.get()
+              case Continue(action, onSuccess, onFailure) =&gt;
+                val actionResult = try {
+                  executeAction(action)
+                } catch { e =&gt;
+                  executeTrace(onFailure(e))
+                }
+                executeTrace(onSuccess(actionResult))
+            }
+          </code></pre>
+        </section>
+        <section>
+          <h3>I/O actions</h3>
+          <ul>
+            <li>Memory cell access</li>
+            <li>FFI</li>
+            <li>Synchronization primitives</li>
+            <li>Other runtime calls</li>
+          </ul>
+        </section>
+        <section>
+          <p>Tracing Handlers</p>
+          <pre style="margin: 0"><code class="hljs lang-scala smallerfont" data-trim data-noescape>
+            def connect(remoteAddr: SocketAddr): <mark class="new">Handler</mark>[Socket] = {
+              fd = socket()
+              try {
+                loop {
+                  rc = connect(fd, remoteAddr)
+                  if (rc == 0)
+                    return Socket(fd)
+                  if (rc == EINPROGRESS)
+                    <mark class="new"><makr class="async">wait</mark></mark>(Read(fd))
+                  else
+                    throw Exception("Failed to connect")
+                }
+              } onEscape {
+                close(fd)
+              }
+            }
+          </code></pre>
+        </section>
+        <section>
+          <h3>Handler actions</h3>
+          <ul>
+            <li>Non-blocking I/O actions</li>
+            <li>Waiting for an event to happen</li>
+            <li>Exit</li>
+            <li>State access</li>
+            <li>Waiting on state condition</li>
+          </ul>
+        </section>
+        <section>
+          <p>Tracing Handlers</p>
+          <pre style="margin: 0"><code class="hljs lang-scala smallerfont" data-trim data-noescape>
+          sealed trait TraceHandler[A]
+          object TraceHandler {
+            final case class Done(result: Try[A]) extends TranceHandler[A]
+            final case class DoIO[B](action: IO[B],
+                                     next: Try[B] =&gt; TraceHandler[A],
+                                     onExit: () =&gt; TranceHandler[Unit])
+                             extends TraceHandler[A]
+            final case class Wait[B](event: <mark class="new">Event</mark>[B],
+                                     next: Try[B] =&gt; TraceHandler[A],
+                                     onExit: () =&gt; TraceHandler[Unit])
+                             extends TraceHandler[A]
+            final case class Exit(onExit: () =&gt; TraceHandler[Unit])
+                             extends TraceHandler[A]
+            // State manipulations
+            ...
+          }
+          </code></pre>
+        </section>
+        <section>
+          <p>Implementing runHandlers</p>
+          <pre><code class="hljs lang-scala" data-trim data-noescape>
+          runHandlers[State](state: State,
+                             handlers: Handler[Unit]*): Spawn[State]
+          </code></pre>
+          <img data-src="run-handlers.svg">
+        </section>
+        <section>
+          <h3>Spawn actions</h3>
+          <ul>
+            <li>Non-blocking I/O actions</li>
+            <li>Waiting for serveral events at once</li>
+            <li><i>Spawning code...</i></li>
+          </ul>
+        </section>
+        <section>
+          <p>Implementing Spawn</p>
+          <pre><code class="hljs lang-scala" data-trim data-noescape>
+          def runSpawn(root: Spawn[A]): IO[A]
+          def spawn(child: Spawn[A]): Spawn[SpawnThread[A]]
+          runSpawn {
+            contract = Contract[TransferProto]
+            transferThread = spawn(runTransfer(contract, remoteAddr))
+            ...
+          }
+          </code></pre>
+          <img data-src="spawn.svg">
+        </section>
+			</div>
+		</div>
+
+		<script src="lib/js/head.min.js"></script>
+		<script src="js/reveal.js"></script>
+
+		<script>
+			// More info about config & dependencies:
+			// - https://github.com/hakimel/reveal.js#configuration
+			// - https://github.com/hakimel/reveal.js#dependencies
+			Reveal.initialize({
+				dependencies: [
+					{ src: 'plugin/markdown/marked.js' },
+					{ src: 'plugin/markdown/markdown.js' },
+					{ src: 'plugin/notes/notes.js', async: true },
+					{ src: 'plugin/highlight/highlight.js', async: true, callback: function() { hljs.initHighlightingOnLoad(); } }
+				]
+			});
+		</script>
+	</body>
+</html>
